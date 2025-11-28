@@ -155,27 +155,56 @@ def extract_text_from_txt(file_bytes):
 
 def chunk_text(records):
     # CRITICAL FIX: Group text by page first to avoid fragmenting into single lines
+    # Also preserve line number information for each chunk with accurate tracking
     pages = {}
+    page_line_map = {}  # Track line numbers for each page
+    
     for rec in records:
         p = rec.get("page", 1)
+        line = rec.get("line", 1)
+        
         if p not in pages:
             pages[p] = []
+            page_line_map[p] = []
+        
         pages[p].append(rec["text"])
+        page_line_map[p].append(line)
         
     splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
     docs = []
     
     for page_num, lines in pages.items():
-        # Reconstruct page text
+        # Reconstruct page text with line tracking
         page_text = "\n".join(lines)
+        line_numbers = page_line_map[page_num]
+        
+        # Get the starting line number for this page
+        starting_line = line_numbers[0] if line_numbers else 1
         
         # Split into meaningful chunks
         chunks = splitter.split_text(page_text)
+        
+        # Calculate line numbers more accurately
+        current_char_pos = 0
         for idx, chunk in enumerate(chunks):
+            # Find which line this chunk starts at by counting newlines up to this point
+            text_before_chunk = page_text[:current_char_pos]
+            lines_before = text_before_chunk.count('\n')
+            
+            # Calculate the actual line number for this chunk
+            if lines_before < len(line_numbers):
+                chunk_line = line_numbers[lines_before]
+            else:
+                # Fallback if we're beyond tracked lines
+                chunk_line = starting_line + lines_before
+            
             docs.append(Document(
                 page_content=chunk, 
-                metadata={"page": page_num, "line": "n/a", "chunk_id": idx}
+                metadata={"page": page_num, "line": chunk_line, "chunk_id": idx}
             ))
+            
+            # Update position for next chunk
+            current_char_pos += len(chunk)
             
     return docs
 
@@ -518,7 +547,20 @@ After completing these steps, provide your final JSON answer.
     # Removed strict similarity threshold to allow LLM reasoning (semantic match) to prevail
     # even if cosine similarity is low due to vocabulary differences.
 
-    supporting_clauses = [f"[Page {d.metadata.get('page')} Line {d.metadata.get('line')}] {d.page_content[:250].strip()}" for d in docs]
+    # Generate supporting clauses with deduplication by page/line
+    seen_locations = set()
+    supporting_clauses = []
+    
+    for d in docs:
+        page = d.metadata.get('page')
+        line = d.metadata.get('line')
+        location_key = (page, line)
+        
+        # Only add if we haven't seen this page/line combination
+        if location_key not in seen_locations:
+            clause_text = d.page_content[:250].strip()
+            supporting_clauses.append(f"[Page {page} Line {line}] {clause_text}")
+            seen_locations.add(location_key)
     
     return {
         "obligation": obligation, "is_present": final_status, "reason": llm_reason,
